@@ -17,9 +17,16 @@ async function proxyToOrigin(c) {
   const url = new URL(c.req.raw.url);
   const originUrl = new URL(url.pathname + url.search, c.env.ORIGIN_URL);
 
+  // Strip the incoming Host header — it's this Worker's own hostname, not the
+  // origin's. Left in place, some origins (anything itself behind Cloudflare) will
+  // reject the request outright since the Host won't match any zone for that IP.
+  // Deleting it lets fetch() set the correct Host for originUrl automatically.
+  const requestHeaders = new Headers(c.req.raw.headers);
+  requestHeaders.delete('host');
+
   const originReq = new Request(originUrl, {
     method: c.req.raw.method,
-    headers: c.req.raw.headers,
+    headers: requestHeaders,
     body: ['GET', 'HEAD'].includes(c.req.raw.method) ? undefined : c.req.raw.body,
     // Required by the Workers runtime when streaming a body through fetch().
     duplex: ['GET', 'HEAD'].includes(c.req.raw.method) ? undefined : 'half'
@@ -31,13 +38,13 @@ async function proxyToOrigin(c) {
   // Content-Length on the Response describing the ORIGINAL compressed bytes — passing
   // that straight through makes the client try to decompress already-decompressed
   // data. Strip them; Cloudflare's edge re-compresses on the way out as needed.
-  const headers = new Headers(originRes.headers);
-  headers.delete('content-encoding');
-  headers.delete('content-length');
+  const responseHeaders = new Headers(originRes.headers);
+  responseHeaders.delete('content-encoding');
+  responseHeaders.delete('content-length');
   return new Response(originRes.body, {
     status: originRes.status,
     statusText: originRes.statusText,
-    headers
+    headers: responseHeaders
   });
 }
 

@@ -1,0 +1,12 @@
+# Secrets
+.env
+
+# Dependencies
+node_modules/
+
+# Logs
+logs/*.log
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db

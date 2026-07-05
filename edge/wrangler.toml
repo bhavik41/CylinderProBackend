@@ -1,0 +1,27 @@
+name = "cylinderpro-edge"
+main = "src/index.js"
+compatibility_date = "2026-01-01"
+
+# Non-secret config. ORIGIN_URL is safe to commit (it's just a public API base URL);
+# JWT_SECRET must NEVER go here — set it with `wrangler secret put JWT_SECRET` instead.
+[vars]
+ORIGIN_URL = "http://localhost:3001"
+
+# General limit: mirrors backend/server.js's apiLimiter (100 req/min).
+[[ratelimits]]
+name = "API_LIMITER"
+namespace_id = "1001"
+  [ratelimits.simple]
+  limit = 100
+  period = 60
+
+# Stricter limit for signin/signup, approximating backend/server.js's authLimiter
+# (10 req/15min) — the binding only supports 10s/60s windows, so this is a tighter
+# per-minute approximation layered in front of the origin's own (still-authoritative)
+# 15-minute limiter, not a replacement for it.
+[[ratelimits]]
+name = "AUTH_LIMITER"
+namespace_id = "1002"
+  [ratelimits.simple]
+  limit = 3
+  period = 60

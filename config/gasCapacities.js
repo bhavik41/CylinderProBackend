@@ -14,21 +14,23 @@ const GAS_CAPACITIES = {
   'MIX':               ['7 m3']
 };
 
-const _gasByLower = {};
-Object.keys(GAS_CAPACITIES).forEach(g => { _gasByLower[g.toLowerCase()] = g; });
-
-// Resolve a (possibly mis-cased) gas-type name to its canonical form, or null if unknown.
-function normalizeGasType(name) {
+// Map-parameterized normalizers (Phase 10): the runtime catalog lives in the GasCapacity
+// collection and is user-managed, so callers pass the live { gas: [sizes] } map. The static
+// GAS_CAPACITIES above remains only as the first-run seed (config/mongodb.js, migratePhase10).
+function normalizeGasTypeIn(map, name) {
   const k = String(name == null ? '' : name).trim().toLowerCase();
-  return _gasByLower[k] || null;
+  const hit = Object.keys(map).find(g => g.toLowerCase() === k);
+  return hit || null;
 }
 
-// Resolve a capacity to its canonical form for the given (already-canonical) gas type, or null.
-// Case- and whitespace-insensitive (e.g. "7  M3" → "7 m3").
-function normalizeCapacity(gasCanonical, cap) {
-  if (!gasCanonical || !GAS_CAPACITIES[gasCanonical]) return null;
+function normalizeCapacityIn(map, gasCanonical, cap) {
+  if (!gasCanonical || !map[gasCanonical]) return null;
   const target = String(cap == null ? '' : cap).trim().toLowerCase().replace(/\s+/g, ' ');
-  return GAS_CAPACITIES[gasCanonical].find(c => c.toLowerCase().replace(/\s+/g, ' ') === target) || null;
+  return map[gasCanonical].find(c => c.toLowerCase().replace(/\s+/g, ' ') === target) || null;
 }
 
-module.exports = { GAS_CAPACITIES, normalizeGasType, normalizeCapacity };
+// Static-map convenience wrappers (legacy callers / seeding).
+function normalizeGasType(name) { return normalizeGasTypeIn(GAS_CAPACITIES, name); }
+function normalizeCapacity(gasCanonical, cap) { return normalizeCapacityIn(GAS_CAPACITIES, gasCanonical, cap); }
+
+module.exports = { GAS_CAPACITIES, normalizeGasType, normalizeCapacity, normalizeGasTypeIn, normalizeCapacityIn };

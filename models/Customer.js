@@ -45,6 +45,15 @@ const customerSchema = new mongoose.Schema({
     type: Number,
     default: 0
   },
+  // Filling vendor (Phase 11): third-party filling station / business partner. GIVEN reads
+  // as "sent for filling", RECEIVED as "received back filled". Exempt from the holding-limit
+  // block and from the PC non-negative guard (their PC balance may go negative = that many
+  // personal cylinders are currently with the vendor). Everything else (location checks,
+  // stock-state checks, history, aging) behaves exactly like a normal customer.
+  is_filling_vendor: {
+    type: Boolean,
+    default: false
+  },
   is_active: {
     type: Boolean,
     default: true

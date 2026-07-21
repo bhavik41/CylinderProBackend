@@ -10,7 +10,8 @@ async function getStats(uid) {
   const customers = await Customer.find({ user_id: uid, customer_type: 'REGULAR', is_active: true });
 
   const totalBilled = bills.reduce((sum, bill) => sum + bill.total_bill_amount, 0);
-  const totalPaid = payments.reduce((sum, payment) => sum + payment.amount_received - payment.discount, 0);
+  // Phase 14: Due = Billed − Net(R−D) − Discount, which reduces to Billed − Σ amount_received.
+  const totalPaid = payments.reduce((sum, payment) => sum + payment.amount_received, 0);
   const total_outstanding = totalBilled - totalPaid;
 
   let totalCylindersOut = 0;
@@ -31,6 +32,7 @@ async function getStats(uid) {
 
   const today_transactions = await Bill.countDocuments({
     user_id: uid,
+    is_draft: { $ne: true },
     bill_date: { $gte: startOfDay, $lte: endOfDay }
   });
 
@@ -46,13 +48,23 @@ async function getStats(uid) {
 }
 
 async function getCylinderStock(uid) {
-  const [totalCylinders, cylindersAtPlant, cylindersInRotation] = await Promise.all([
+  // Response keys kept from the old single-status model:
+  //   cylindersAtPlant   = IN_STOCK (any site), cylindersInRotation = AT_CUSTOMER.
+  // byLocation = IN_STOCK counts per site.
+  const [totalCylinders, cylindersAtPlant, cylindersInRotation, perLocation] = await Promise.all([
     Cylinder.countDocuments({ user_id: uid }),
-    Cylinder.countDocuments({ user_id: uid, status: 'at-plant' }),
-    Cylinder.countDocuments({ user_id: uid, status: 'in-rotation' })
+    Cylinder.countDocuments({ user_id: uid, stock_state: 'IN_STOCK' }),
+    Cylinder.countDocuments({ user_id: uid, stock_state: 'AT_CUSTOMER' }),
+    Cylinder.aggregate([
+      { $match: { user_id: new (require('mongoose').Types.ObjectId)(uid), stock_state: 'IN_STOCK' } },
+      { $group: { _id: '$location', count: { $sum: 1 } } }
+    ])
   ]);
 
-  return { totalCylinders, cylindersInRotation, cylindersAtPlant };
+  const byLocation = {};
+  perLocation.forEach(r => { byLocation[r._id] = r.count; });
+
+  return { totalCylinders, cylindersInRotation, cylindersAtPlant, byLocation };
 }
 
 async function getOverLimitCustomers(uid) {
@@ -66,7 +78,8 @@ async function getOverLimitCustomers(uid) {
     // Cross-customer-return-aware holding count (shared with customers & reports services).
     const { held: cylindersHeld } = computeHoldings(bills);
 
-    if (cylindersHeld > customer.holding_limit) {
+    // Filling vendors have no holding limit (Phase 15) — never flagged over limit.
+    if (!customer.is_filling_vendor && cylindersHeld > (customer.holding_limit || 0)) {
       overLimitCustomers.push({
         customer_id: customer._id,
         company_name: customer.company_name,

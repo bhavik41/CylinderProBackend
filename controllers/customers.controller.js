@@ -37,3 +37,10 @@ exports.getPersonalCylinderHistory = asyncHandler(async (req, res) => {
 exports.getCustomerPayments = asyncHandler(async (req, res) => {
   res.json(await customerService.getCustomerPayments(req.user.id, req.params.id));
 });
+
+// Per gas+size personal-cylinder balances (Phase 11) — feeds the New Transaction form's
+// per-combo PC return caps. Keys: "GasName|SizeLabel" → net count at plant.
+exports.getPcBalances = asyncHandler(async (req, res) => {
+  const { personalByComboForCustomer } = require('../services/bill.service');
+  res.json(await personalByComboForCustomer(req.user.id, req.params.id));
+});

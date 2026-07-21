@@ -2,10 +2,15 @@ const Payment = require('../models/Payment');
 const Bill = require('../models/Bill');
 const HttpError = require('../utils/HttpError');
 
+// receipt_number is globally unique, so the next number must come from the numeric max —
+// not the newest-by-createdAt document, whose number can lag behind (e.g. backdated entries).
 async function generateReceiptNumber() {
-  const lastReceipt = await Payment.findOne().sort('-createdAt');
-  const nextId = lastReceipt ? parseInt(lastReceipt.receipt_number.split('-')[1]) + 1 : 1;
-  return `RCP-${String(nextId).padStart(4, '0')}`;
+  const receipts = await Payment.find({}, 'receipt_number').lean();
+  const max = receipts.reduce((m, r) => {
+    const n = parseInt(String(r.receipt_number).split('-')[1], 10);
+    return Number.isFinite(n) && n > m ? n : m;
+  }, 0);
+  return `RCP-${String(max + 1).padStart(4, '0')}`;
 }
 
 async function createPayment(userId, body) {
@@ -18,7 +23,6 @@ async function createPayment(userId, body) {
     payment_mode,
     cheque_number,
     upi_transaction_id,
-    challan_no,
     remarks
   } = body;
 
@@ -32,9 +36,10 @@ async function createPayment(userId, body) {
 
   const receiptNumber = await generateReceiptNumber();
 
-  // Carry the challan number from the linked bill if not explicitly provided
-  let finalChallanNo = challan_no || '';
-  if (!finalChallanNo && bill_id) {
+  // Challan is never entered manually on payments (Phase 5) — it is derived from the linked
+  // bill when there is one, purely for receipt display.
+  let finalChallanNo = '';
+  if (bill_id) {
     const linkedBill = await Bill.findOne({ _id: bill_id, user_id: userId });
     if (linkedBill) finalChallanNo = linkedBill.challan_no || '';
   }
@@ -82,7 +87,7 @@ async function listPayments(userId, customerId) {
 }
 
 async function updatePayment(userId, paymentId, body) {
-  const allowed = ['challan_no', 'cheque_number', 'upi_transaction_id', 'remarks', 'payment_mode', 'amount_received', 'discount', 'date'];
+  const allowed = ['cheque_number', 'upi_transaction_id', 'remarks', 'payment_mode', 'amount_received', 'discount', 'date'];
   const updates = {};
   allowed.forEach(field => {
     if (body[field] !== undefined) updates[field] = body[field];

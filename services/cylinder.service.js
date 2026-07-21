@@ -1,12 +1,38 @@
 const Cylinder = require('../models/Cylinder');
 const Bill = require('../models/Bill');
 const HttpError = require('../utils/HttpError');
-const { normalizeGasType, normalizeCapacity } = require('../config/gasCapacities');
+const { normalizeGasTypeIn, normalizeCapacityIn } = require('../config/gasCapacities');
+const { getGasCapacities } = require('./masters.service');
+const { LOCATIONS } = require('../config/locations');
 const { insertInBatches } = require('../utils/bulkInsert');
 
-// Cylinder Aging Report — every in-rotation cylinder joined with its latest "Given" record.
-async function getAgingReport(uid, { mode, minDays, maxDays, thresholdDays, sortBy, sortOrder }) {
-  const cylinders = await Cylinder.find({ user_id: uid, status: 'in-rotation' });
+// Accept friendly location spellings from forms/imports → canonical enum (or null if invalid).
+function normalizeLocation(v) {
+  const s = String(v == null ? '' : v).trim().toUpperCase().replace(/[\s-]+/g, '_');
+  if (!s) return null;
+  if (LOCATIONS.includes(s)) return s;
+  if (s.includes('CHANDISAR') || s.includes('PLANT')) return 'AT_PLANT_CHANDISAR';
+  if (s.includes('PALANPUR')) return 'AT_PALANPUR_OFFICE';
+  if (s.includes('CHHAPI')) return 'AT_CHHAPI_OFFICE';
+  return null;
+}
+
+// Accept friendly stock-state spellings → canonical enum (or null if invalid).
+function normalizeStockState(v) {
+  const s = String(v == null ? '' : v).trim().toUpperCase().replace(/[\s-]+/g, '_');
+  if (!s) return null;
+  if (s === 'IN_STOCK' || s === 'INSTOCK' || s === 'STOCK') return 'IN_STOCK';
+  if (s === 'AT_CUSTOMER' || s === 'CUSTOMER' || s === 'WITH_CUSTOMER') return 'AT_CUSTOMER';
+  return null;
+}
+
+// Cylinder Aging Report — every at-customer cylinder joined with its latest "Given" record.
+// `location` (optional) restricts to cylinders issued from that site — the days-held
+// calculation itself is untouched; this only narrows which rows are returned.
+async function getAgingReport(uid, { mode, minDays, maxDays, thresholdDays, sortBy, sortOrder, location }) {
+  const cylQuery = { user_id: uid, stock_state: 'AT_CUSTOMER' };
+  if (location && LOCATIONS.includes(location)) cylQuery.location = location;
+  const cylinders = await Cylinder.find(cylQuery);
 
   // Build a map of rotational_number -> latest GIVEN line (with its bill + customer)
   const bills = await Bill.find({ user_id: uid })
@@ -32,9 +58,10 @@ async function getAgingReport(uid, { mode, minDays, maxDays, thresholdDays, sort
       // Edge case: cylinder is in-rotation but no matching GIVEN transaction was found.
       return {
         rotational_number: c.rotational_number,
-        physical_number: c.physical_number,
         gas_type: c.gas_type,
         capacity: c.capacity,
+        location: c.location,
+        customer_id: null,
         customer_name: null,
         customer_phone: null,
         customer_address: null,
@@ -49,9 +76,10 @@ async function getAgingReport(uid, { mode, minDays, maxDays, thresholdDays, sort
     const cust = rec.bill.customer_id || {};
     return {
       rotational_number: c.rotational_number,
-      physical_number: c.physical_number,
       gas_type: c.gas_type,
       capacity: c.capacity,
+      location: c.location,
+      customer_id: cust._id ? String(cust._id) : null,
       customer_name: cust.company_name || null,
       customer_phone: cust.phone_primary || null,
       customer_address: cust.address || null,
@@ -98,28 +126,83 @@ async function getAgingReport(uid, { mode, minDays, maxDays, thresholdDays, sort
   return rows;
 }
 
-async function listCylinders(uid, { search, status }) {
-  const query = { user_id: uid };
+// Rotational numbers are plain numbers ("1", "2", "100"), so listings must sort numerically
+// (1, 2, 6, 10, 100 — not 1, 10, 100, 2). Mongo's numericOrdering collation does this server-side.
+const NATURAL = { locale: 'en', numericOrdering: true };
 
-  if (status) query.status = status;
+// Filters:
+//   location — comma-separated multi-select (e.g. "AT_PLANT_CHANDISAR,AT_CHHAPI_OFFICE")
+//   state    — comma-separated multi-select of IN_STOCK | AT_CUSTOMER | UNDER_MAINTENANCE.
+//              The three are disjoint views: IN_STOCK excludes maintenance cylinders,
+//              UNDER_MAINTENANCE is the independent maintenance flag.
+//   stock_state — legacy single-value param, still honored (maps onto `state`).
+function stateClause(s) {
+  if (s === 'UNDER_MAINTENANCE') return { under_maintenance: true };
+  if (s === 'IN_STOCK') return { stock_state: 'IN_STOCK', under_maintenance: { $ne: true } };
+  if (s === 'AT_CUSTOMER') return { stock_state: 'AT_CUSTOMER' };
+  return null;
+}
+
+async function listCylinders(uid, { search, stock_state, location, state }) {
+  const query = { user_id: uid };
+  const and = [];
+
+  const locations = String(location || '').split(',').map(s => s.trim()).filter(Boolean);
+  if (locations.length) query.location = { $in: locations };
+
+  const states = String(state || stock_state || '').split(',').map(s => s.trim()).filter(Boolean);
+  const clauses = states.map(stateClause).filter(Boolean);
+  if (clauses.length === 1) and.push(clauses[0]);
+  else if (clauses.length > 1) and.push({ $or: clauses });
 
   if (search) {
     const re = new RegExp(search.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
-    query.$or = [
+    and.push({ $or: [
       { rotational_number: re },
       { physical_number: re },
       { gas_type: re }
-    ];
+    ] });
   }
 
-  return Cylinder.find(query).sort('rotational_number');
+  if (and.length) query.$and = and;
+
+  return Cylinder.find(query).collation(NATURAL).sort('rotational_number');
 }
 
-// All cylinders currently in-rotation (out of plant), each annotated with its CURRENT holder
+// Toggle maintenance. ON requires the cylinder to be IN_STOCK at Chandisar right now
+// (backend-enforced, not just hidden in the UI). OFF returns it to plain IN_STOCK there.
+// Never touches location/stock_state — those remain owned by the Bill post-save hook.
+async function setMaintenance(uid, id, on) {
+  const cylinder = await Cylinder.findOne({ _id: id, user_id: uid });
+  if (!cylinder) throw new HttpError(404, 'Cylinder not found');
+
+  if (on) {
+    if (cylinder.under_maintenance) throw new HttpError(400, 'Cylinder is already under maintenance');
+    if (cylinder.stock_state !== 'IN_STOCK' || cylinder.location !== 'AT_PLANT_CHANDISAR') {
+      throw new HttpError(400, 'Only cylinders in stock at Chandisar Plant can be put under maintenance');
+    }
+    cylinder.under_maintenance = true;
+    cylinder.maintenance_since = new Date();
+  } else {
+    if (!cylinder.under_maintenance) throw new HttpError(400, 'Cylinder is not under maintenance');
+    cylinder.under_maintenance = false;
+    cylinder.maintenance_since = null;
+  }
+
+  await cylinder.save();
+  return {
+    cylinder_id: cylinder._id,
+    under_maintenance: cylinder.under_maintenance,
+    maintenance_since: cylinder.maintenance_since,
+    message: on ? 'Cylinder moved to maintenance' : 'Cylinder returned to stock'
+  };
+}
+
+// All cylinders currently AT_CUSTOMER (out with customers), each annotated with its CURRENT holder
 // (the customer of its most recent not-yet-returned GIVEN line). Used for the "Received" / swap-return
 // dropdown and for client-side cross-customer mismatch detection.
 async function listInRotation(uid) {
-  const inRotation = await Cylinder.find({ user_id: uid, status: 'in-rotation' }).sort('rotational_number');
+  const inRotation = await Cylinder.find({ user_id: uid, stock_state: 'AT_CUSTOMER' }).collation(NATURAL).sort('rotational_number');
   if (!inRotation.length) return [];
 
   const bills = await Bill.find({ user_id: uid })
@@ -160,7 +243,7 @@ function translateDuplicateKeyError(error) {
   return null;
 }
 
-async function createCylinder(uid, { rotational_number, physical_number, gas_type, capacity, status }) {
+async function createCylinder(uid, { rotational_number, physical_number, gas_type, capacity, location, stock_state }) {
   if (!rotational_number || !gas_type || !capacity) {
     throw new HttpError(400, 'Rotational number, gas type, and capacity are all required');
   }
@@ -172,7 +255,8 @@ async function createCylinder(uid, { rotational_number, physical_number, gas_typ
     physical_number: (physical_number && physical_number.trim()) ? physical_number.trim() : undefined,
     gas_type,
     capacity,
-    status: status === 'in-rotation' ? 'in-rotation' : 'at-plant'
+    location: normalizeLocation(location) || 'AT_PLANT_CHANDISAR',
+    stock_state: normalizeStockState(stock_state) || 'IN_STOCK'
   });
 
   try {
@@ -185,7 +269,7 @@ async function createCylinder(uid, { rotational_number, physical_number, gas_typ
 }
 
 // ─── One-time bulk import (onboarding) ───
-// rows: [{ __row, rotational_number, physical_number, gas_type, capacity, status }].
+// rows: [{ __row, rotational_number, physical_number, gas_type, capacity, location, stock_state }].
 // Re-validated server-side: required fields, valid gas_type + capacity-for-gas, in-file uniqueness.
 // Inserts scoped to uid; duplicates vs existing records are reported as `skipped`.
 async function importCylinders(uid, rows) {
@@ -194,6 +278,9 @@ async function importCylinders(uid, rows) {
   }
 
   const str = (v) => String(v == null ? '' : v).trim();
+
+  // Live user-managed catalog (Phase 10) — not the static config seed.
+  const catalog = await getGasCapacities();
 
   const items = [];
   const failed = [];
@@ -206,9 +293,9 @@ async function importCylinders(uid, rows) {
     const physical_number = str(r.physical_number);
     if (!rotational_number) { failed.push({ row, reason: 'rotational_number is required' }); return; }
 
-    const gas = normalizeGasType(r.gas_type);
+    const gas = normalizeGasTypeIn(catalog, r.gas_type);
     if (!gas) { failed.push({ row, reason: `Invalid gas_type "${str(r.gas_type)}"` }); return; }
-    const capacity = normalizeCapacity(gas, r.capacity);
+    const capacity = normalizeCapacityIn(catalog, gas, r.capacity);
     if (!capacity) { failed.push({ row, reason: `Invalid capacity "${str(r.capacity)}" for ${gas}` }); return; }
 
     const rotKey = rotational_number.toLowerCase();
@@ -220,7 +307,11 @@ async function importCylinders(uid, rows) {
       seenPhy.add(phyKey);
     }
 
-    const st = str(r.status).toLowerCase().replace(/[\s_]+/g, '-');
+    const loc = normalizeLocation(r.location);
+    if (str(r.location) && !loc) { failed.push({ row, reason: `Invalid location "${str(r.location)}"` }); return; }
+    const stock = normalizeStockState(r.stock_state);
+    if (str(r.stock_state) && !stock) { failed.push({ row, reason: `Invalid stock_state "${str(r.stock_state)}"` }); return; }
+
     items.push({
       __row: row,
       doc: {
@@ -229,7 +320,8 @@ async function importCylinders(uid, rows) {
         physical_number: physical_number || undefined, // omit so the partial unique index ignores it
         gas_type: gas,
         capacity,
-        status: st === 'in-rotation' ? 'in-rotation' : 'at-plant'
+        location: loc || 'AT_PLANT_CHANDISAR',
+        stock_state: stock || 'IN_STOCK'
       }
     });
   });
@@ -243,7 +335,7 @@ async function importCylinders(uid, rows) {
 }
 
 async function updateCylinder(uid, id, body) {
-  const allowed = ['rotational_number', 'physical_number', 'gas_type', 'capacity', 'status'];
+  const allowed = ['rotational_number', 'physical_number', 'gas_type', 'capacity', 'location', 'stock_state'];
   const updates = {};
   const unset = {};
   allowed.forEach(field => {
@@ -257,6 +349,19 @@ async function updateCylinder(uid, id, body) {
     updates.physical_number = String(updates.physical_number).trim();
   }
   const mutation = Object.keys(unset).length ? { $set: updates, $unset: unset } : updates;
+
+  // ─── Gas-type / capacity edit gate (Phase 9) ───
+  // Same gate as the maintenance toggle: the cylinder must be IN_STOCK at Chandisar Plant.
+  // Historical bills are unaffected either way — their line items carry name snapshots.
+  if (updates.gas_type !== undefined || updates.capacity !== undefined) {
+    const current = await Cylinder.findOne({ _id: id, user_id: uid });
+    if (!current) throw new HttpError(404, 'Cylinder not found');
+    const changingType = (updates.gas_type !== undefined && updates.gas_type !== current.gas_type) ||
+                         (updates.capacity !== undefined && updates.capacity !== current.capacity);
+    if (changingType && (current.location !== 'AT_PLANT_CHANDISAR' || current.stock_state !== 'IN_STOCK')) {
+      throw new HttpError(400, 'Gas type / capacity can only be changed while the cylinder is In Stock at Chandisar Plant.');
+    }
+  }
 
   let cylinder;
   try {
@@ -282,6 +387,7 @@ async function deleteCylinder(uid, id) {
 module.exports = {
   getAgingReport,
   listCylinders,
+  setMaintenance,
   listInRotation,
   getCylinder,
   createCylinder,

@@ -7,6 +7,9 @@ node_modules/
 # Logs
 logs/*.log
 
+# Database dumps
+backups/
+
 # OS / editor cruft
 .DS_Store
 Thumbs.db

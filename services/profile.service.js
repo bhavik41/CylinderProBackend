@@ -10,7 +10,10 @@ const Customer = require('../models/Customer');
 const Bill = require('../models/Bill');
 const Payment = require('../models/Payment');
 const Cylinder = require('../models/Cylinder');
+const LocationProfile = require('../models/LocationProfile');
+const RentalCharge = require('../models/RentalCharge');
 const HttpError = require('../utils/HttpError');
+const { LOCATIONS } = require('../config/locations');
 
 // DD/MM/YYYY for exports
 const ddmmyyyy = (d) => {
@@ -31,9 +34,80 @@ async function getAccount(userId) {
     name: user.name,
     email: user.email,
     phone: user.phone || '',
+    active_location: user.active_location || 'AT_PLANT_CHANDISAR',
     member_since: user.createdAt,
     last_login: user.last_login || null
   };
+}
+
+// ─── Location profiles (Phase 2) ───
+// Fixed set of 3 per user (one per site). Lazily seeds any missing records so the
+// migration script and brand-new signups both end up with the full set.
+async function getLocationProfiles(userId) {
+  const existing = await LocationProfile.find({ user_id: userId });
+  const have = new Set(existing.map(p => p.location));
+  const missing = LOCATIONS.filter(l => !have.has(l));
+  if (missing.length) {
+    // Insert one at a time and tolerate races on the unique (user_id, location) index.
+    for (const location of missing) {
+      try { existing.push(await LocationProfile.create({ user_id: userId, location })); }
+      catch (e) { if (e.code !== 11000) throw e; }
+    }
+  }
+  const user = await User.findById(userId).select('active_location');
+  const profiles = LOCATIONS.map(l => {
+    const p = existing.find(x => x.location === l) || {};
+    return {
+      location: l,
+      manager_name: p.manager_name || '',
+      contact_number: p.contact_number || '',
+      challan_prefix: p.challan_prefix || ''
+    };
+  });
+  return { active_location: (user && user.active_location) || 'AT_PLANT_CHANDISAR', profiles };
+}
+
+// Only manager/contact/prefix are editable — `location` identifies the record and is immutable.
+async function updateLocationProfile(userId, location, { manager_name, contact_number, challan_prefix }) {
+  if (!LOCATIONS.includes(location)) throw new HttpError(400, 'Unknown location');
+  const update = {};
+  if (manager_name !== undefined) update.manager_name = String(manager_name).trim();
+  if (contact_number !== undefined) update.contact_number = String(contact_number).trim();
+  if (challan_prefix !== undefined) update.challan_prefix = String(challan_prefix).trim();
+
+  const profile = await LocationProfile.findOneAndUpdate(
+    { user_id: userId, location },
+    { $set: update, $setOnInsert: { user_id: userId, location } },
+    { new: true, upsert: true, setDefaultsOnInsert: true }
+  );
+  return {
+    message: 'Location profile saved',
+    profile: {
+      location: profile.location,
+      manager_name: profile.manager_name || '',
+      contact_number: profile.contact_number || '',
+      challan_prefix: profile.challan_prefix || ''
+    }
+  };
+}
+
+// Phase 20: one shared Save commits all three location profiles together.
+async function updateLocationProfilesBatch(userId, profiles) {
+  if (!Array.isArray(profiles) || profiles.length === 0) throw new HttpError(400, 'A profiles array is required');
+  for (const p of profiles) {
+    if (!p || !LOCATIONS.includes(p.location)) throw new HttpError(400, `Unknown location "${p && p.location}"`);
+  }
+  for (const p of profiles) {
+    await updateLocationProfile(userId, p.location, p);
+  }
+  return { message: 'All location profiles saved', saved: profiles.map(p => p.location) };
+}
+
+// Switching only changes UI defaults — it never touches Bill/Cylinder/Customer data.
+async function setActiveLocation(userId, location) {
+  if (!LOCATIONS.includes(location)) throw new HttpError(400, 'Unknown location');
+  await User.updateOne({ _id: userId }, { active_location: location });
+  return { message: 'Active location updated', active_location: location };
 }
 
 async function updateAccount(userId, { name, phone, email, current_password }) {
@@ -43,14 +117,26 @@ async function updateAccount(userId, { name, phone, email, current_password }) {
   if (typeof name === 'string' && name.trim()) user.name = name.trim();
   if (typeof phone === 'string') user.phone = phone.trim();
 
+  let emailChanged = false;
   if (email && email.toLowerCase() !== user.email) {
+    // 400 (not 401) — a missing/wrong password here must never trigger the client's
+    // expired-session auto-logout.
     if (!current_password || !(await user.comparePassword(current_password))) {
-      throw new HttpError(401, 'Current password is required to change email');
+      throw new HttpError(400, 'Current password is required to change email');
     }
     const exists = await User.findOne({ email: email.toLowerCase(), _id: { $ne: user._id } });
     if (exists) throw new HttpError(400, 'That email is already in use');
     user.email = email.toLowerCase();
+    user.email_verified = false; // a new address must be verified again
+    emailChanged = true;
   }
+
+  // Phase 20: the bootstrap Trusted Person mirrors Account Information — sync BEFORE saving
+  // the user so a conflict (e.g. email already on the list) aborts the whole save.
+  await require('./trustedPeople.service').syncBootstrap(userId, {
+    name: user.name,
+    email: emailChanged ? user.email : undefined
+  });
 
   await user.save();
   return { message: 'Profile updated', name: user.name, email: user.email, phone: user.phone || '' };
@@ -60,8 +146,10 @@ async function changePassword(userId, { current_password, new_password, confirm_
   const user = await User.findById(userId);
   if (!user) throw new HttpError(404, 'User not found');
 
+  // 400 (not 401) — a wrong current password must never trigger the client's
+  // expired-session auto-logout; the session itself is fine.
   if (!current_password || !(await user.comparePassword(current_password))) {
-    throw new HttpError(401, 'Current password is incorrect');
+    throw new HttpError(400, 'Current password is incorrect');
   }
   if (!STRONG_PASSWORD(new_password)) {
     throw new HttpError(400, 'New password must be at least 8 characters and include a number and a special character');
@@ -108,19 +196,30 @@ async function logoutAll(userId) {
   return { message: 'All sessions logged out' };
 }
 
-async function deleteAccount(userId, password) {
+// Phase 21: deletion needs BOTH the password AND an owner-only step-up approval — several
+// people may know the shared password, but only the bootstrap owner can authorize this.
+async function deleteAccount(userId, password, stepUpToken) {
   const user = await User.findById(userId);
   if (!user) throw new HttpError(404, 'User not found');
+  // 400 (not 401) — a wrong password must never trigger the client's expired-session auto-logout.
   if (!password || !(await user.comparePassword(password))) {
-    throw new HttpError(401, 'Incorrect password');
+    throw new HttpError(400, 'Incorrect password');
   }
+  await require('./stepup.service').requireOwnerStepUp(userId, stepUpToken, 'Deleting the account');
 
   await Promise.all([
     Customer.deleteMany({ user_id: userId }),
     Bill.deleteMany({ user_id: userId }),
     Payment.deleteMany({ user_id: userId }),
     Cylinder.deleteMany({ user_id: userId }),
-    BusinessProfile.deleteMany({ user_id: userId })
+    BusinessProfile.deleteMany({ user_id: userId }),
+    LocationProfile.deleteMany({ user_id: userId }),
+    RentalCharge.deleteMany({ user_id: userId }),
+    require('../models/FillingLogEntry').deleteMany({ user_id: userId }),
+    require('../models/LocationPcStock').deleteMany({ user_id: userId }),
+    require('../models/TrustedPerson').deleteMany({ user_id: userId }),
+    require('../models/OtpToken').deleteMany({ user_id: userId }),
+    require('../models/AuditLog').deleteMany({ user_id: userId })
   ]);
   await User.deleteOne({ _id: userId });
 
@@ -165,8 +264,8 @@ async function exportData(userId, res) {
         'Type': b.transaction_type || '',
         'Challan No': b.challan_no || '',
         'Direction': li.direction || '',
-        'Gas Type': li.gas_type_id ? li.gas_type_id.gas_type_name : '',
-        'Size': li.cylinder_size_id ? li.cylinder_size_id.size_label : '',
+        'Gas Type': li.gas_type_name || (li.gas_type_id ? li.gas_type_id.gas_type_name : ''),
+        'Size': li.size_label || (li.cylinder_size_id ? li.cylinder_size_id.size_label : ''),
         'Serial No': li.serial_number || '',
         'Qty': li.quantity || 0,
         'Rate': li.rate || 0,
@@ -197,11 +296,12 @@ async function exportData(userId, res) {
     'Physical No': c.physical_number || '',
     'Gas Type': c.gas_type || '',
     'Capacity': c.capacity || '',
-    'Status': c.status === 'in-rotation' ? 'In Rotation' : 'At Plant'
+    'Location': c.location || '',
+    'Stock State': c.stock_state === 'AT_CUSTOMER' ? 'At Customer' : 'In Stock'
   }));
 
-  // Aging report: in-rotation cylinders with latest GIVEN details + days out
-  const inRotation = cylinders.filter(c => c.status === 'in-rotation');
+  // Aging report: at-customer cylinders with latest GIVEN details + days out
+  const inRotation = cylinders.filter(c => c.stock_state === 'AT_CUSTOMER');
   const agingRows = inRotation.map((c, i) => {
     // Find the most recent GIVEN line for this rotational number not yet returned
     let latest = null;
@@ -259,6 +359,10 @@ module.exports = {
   changePassword,
   getBusinessProfile,
   updateBusinessProfile,
+  getLocationProfiles,
+  updateLocationProfile,
+  updateLocationProfilesBatch,
+  setActiveLocation,
   logoutAll,
   deleteAccount,
   exportData

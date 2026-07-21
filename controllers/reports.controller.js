@@ -1,6 +1,18 @@
 const asyncHandler = require('../middleware/asyncHandler');
 const reportService = require('../services/report.service');
 
+exports.getDSR = asyncHandler(async (req, res) => {
+  res.json(await reportService.getDSR(req.user.id, req.query));
+});
+
+exports.getStockSummary = asyncHandler(async (req, res) => {
+  res.json(await reportService.getStockSummary(req.user.id, req.query));
+});
+
+exports.getPcStock = asyncHandler(async (req, res) => {
+  res.json(await reportService.getPcStock(req.user.id, req.query.location));
+});
+
 exports.getLedgerReport = asyncHandler(async (req, res) => {
   res.json(await reportService.getLedgerReport(req.user.id));
 });

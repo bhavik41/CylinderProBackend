@@ -13,6 +13,7 @@ router.get('/in-rotation', ctrl.listInRotation);
 router.get('/:id', ctrl.getCylinder);
 router.post('/', ctrl.createCylinder);
 router.post('/import', ctrl.importCylinders);
+router.post('/:id/maintenance', ctrl.setMaintenance);
 router.put('/:id', ctrl.updateCylinder);
 router.delete('/:id', ctrl.deleteCylinder);
 

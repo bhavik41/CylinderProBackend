@@ -26,6 +26,10 @@ exports.importCylinders = asyncHandler(async (req, res) => {
   res.json(await cylinderService.importCylinders(req.user.id, rows));
 });
 
+exports.setMaintenance = asyncHandler(async (req, res) => {
+  res.json(await cylinderService.setMaintenance(req.user.id, req.params.id, !!req.body.on));
+});
+
 exports.updateCylinder = asyncHandler(async (req, res) => {
   res.json(await cylinderService.updateCylinder(req.user.id, req.params.id, req.body));
 });

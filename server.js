@@ -101,6 +101,10 @@ const dashboardRoutes = require('./routes/dashboard');
 const masterRoutes = require('./routes/masters');
 const cylinderRoutes = require('./routes/cylinders');
 const profileRoutes = require('./routes/profile');
+const rentalChargeRoutes = require('./routes/rentalCharges');
+const fillingLogRoutes = require('./routes/fillingLog');
+const trustedPeopleRoutes = require('./routes/trustedPeople');
+const stepUpRoutes = require('./routes/stepup');
 
 app.use('/api/customers', customerRoutes);
 app.use('/api/bills', billRoutes);
@@ -110,6 +114,10 @@ app.use('/api/dashboard', dashboardRoutes);
 app.use('/api/masters', masterRoutes);
 app.use('/api/cylinders', cylinderRoutes);
 app.use('/api/profile', profileRoutes);
+app.use('/api/rental-charges', rentalChargeRoutes);
+app.use('/api/filling-log', fillingLogRoutes);
+app.use('/api/trusted-people', trustedPeopleRoutes);
+app.use('/api/step-up', stepUpRoutes);
 
 // Error handling middleware — never leak raw stack/objects to the client.
 app.use((err, req, res, next) => {
@@ -120,6 +128,18 @@ app.use((err, req, res, next) => {
   // HttpError (thrown intentionally by a service) carries its own status + safe message.
   if (err.status) {
     return res.status(err.status).json({ error: err.message });
+  }
+  // Mongoose validation/cast failures are caller mistakes, not server faults.
+  if (err.name === 'ValidationError' && err.errors) {
+    const details = Object.values(err.errors).map((e) => e.message).join('; ');
+    return res.status(400).json({ error: details || 'Invalid data submitted.' });
+  }
+  if (err.name === 'CastError') {
+    return res.status(400).json({ error: `Invalid value for ${err.path || 'a field'}.` });
+  }
+  if (err.code === 11000) {
+    const field = Object.keys(err.keyPattern || {}).filter((k) => k !== 'user_id').join(', ');
+    return res.status(409).json({ error: field ? `A record with this ${field} already exists.` : 'This record already exists.' });
   }
   res.status(500).json({ error: 'Something went wrong. Please try again.' });
 });

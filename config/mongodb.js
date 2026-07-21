@@ -25,22 +25,29 @@ const connectDB = async () => {
 const initializeDefaultData = async () => {
   const GasType = require('../models/GasType');
   const CylinderSize = require('../models/CylinderSize');
-  
+  const GasCapacity = require('../models/GasCapacity');
+
   try {
-    // Gas type -> valid capacities (single backend source; mirrors GAS_CAPACITIES in frontend/app.js)
+    // Static config seeds the catalog on first run only (Phase 10): the GasCapacity
+    // collection is the runtime source of truth afterwards, managed from Profile.
     const { GAS_CAPACITIES } = require('./gasCapacities');
 
     for (const gasType of Object.keys(GAS_CAPACITIES)) {
       await GasType.findOneAndUpdate(
         { gas_type_name: gasType },
-        { gas_type_name: gasType, is_active: true },
+        { $setOnInsert: { gas_type_name: gasType, is_active: true } },
         { upsert: true, new: true }
+      );
+      await GasCapacity.updateOne(
+        { gas_type_name: gasType },
+        { $setOnInsert: { gas_type_name: gasType, sizes: GAS_CAPACITIES[gasType] } },
+        { upsert: true }
       );
     }
 
-    // Prune gas types no longer in the canonical list (e.g. the old
-    // 'Industrial Oxygen' / 'Medical Oxygen' split, now merged into 'Oxygen').
-    await GasType.deleteMany({ gas_type_name: { $nin: Object.keys(GAS_CAPACITIES) } });
+    // Prune ONLY the known-legacy names (the old Oxygen split) — never user-added gas
+    // types: the catalog is user-managed now (Phase 10).
+    await GasType.deleteMany({ gas_type_name: { $in: ['Industrial Oxygen', 'Medical Oxygen'] } });
 
     // All distinct capacities across every gas type
     const sizes = [...new Set(Object.values(GAS_CAPACITIES).flat())];
@@ -48,7 +55,7 @@ const initializeDefaultData = async () => {
     for (const size of sizes) {
       await CylinderSize.findOneAndUpdate(
         { size_label: size },
-        { size_label: size, is_active: true },
+        { $setOnInsert: { size_label: size, is_active: true } },
         { upsert: true, new: true }
       );
     }

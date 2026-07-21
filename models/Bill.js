@@ -1,9 +1,12 @@
 const mongoose = require('mongoose');
+const { LOCATIONS } = require('../config/locations');
 
 const billLineItemSchema = new mongoose.Schema({
   direction: {
     type: String,
-    enum: ['GIVEN', 'RECEIVED'],
+    // TRANSFER lines belong to INTERNAL_TRANSFER bills only — they are deliberately NOT
+    // 'GIVEN', so holder-detection (findCurrentGiven) and dashboard out-counts ignore them.
+    enum: ['GIVEN', 'RECEIVED', 'TRANSFER'],
     required: true
   },
   gas_type_id: {
@@ -16,6 +19,14 @@ const billLineItemSchema = new mongoose.Schema({
     ref: 'CylinderSize',
     required: true
   },
+  // Snapshot values captured at transaction time (Phase 9). Display always prefers these, so
+  // historical bills / DSR entries never change when a cylinder's or master's current
+  // type/size is edited or removed later. Backfilled on old bills by scripts/migratePhase9.js.
+  gas_type_name: { type: String, default: '' },
+  size_label:    { type: String, default: '' },
+  // Free-text per-row note shown on the DSR (Phase 10) — additive next to the PC columns,
+  // written quietly via PATCH /bills/:id/dsr-remark (no edit_history, no 3-day lock).
+  remarks: { type: String, default: '' },
   serial_number: {
     type: String,
     default: ''   // blank for personal-cylinder-only lines (quantity-only, no inventory cylinder)
@@ -55,10 +66,46 @@ const billSchema = new mongoose.Schema({
     required: true,
     unique: true
   },
+  // CUSTOMER = normal bill against a customer; INTERNAL_TRANSFER = moving our own
+  // cylinders between sites (no customer, no amounts).
+  transaction_category: {
+    type: String,
+    enum: ['CUSTOMER', 'INTERNAL_TRANSFER'],
+    default: 'CUSTOMER'
+  },
+  // Save-for-later draft (Phase 5): keeps the real bill-number sequence but stores the raw
+  // form state in draft_payload; customer/challan/lines may be incomplete until finalized.
+  is_draft: {
+    type: Boolean,
+    default: false,
+    index: true
+  },
+  draft_payload: {
+    type: mongoose.Schema.Types.Mixed,
+    default: null
+  },
   customer_id: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'Customer',
-    required: true
+    // Required for finalized CUSTOMER bills; optional for INTERNAL_TRANSFER and drafts.
+    required: function () { return !this.is_draft && this.transaction_category !== 'INTERNAL_TRANSFER'; }
+  },
+  // CUSTOMER bills: the site the transaction happened at (drafts are scoped by this too).
+  location: {
+    type: String,
+    enum: LOCATIONS,
+    required: function () { return this.transaction_category !== 'INTERNAL_TRANSFER'; }
+  },
+  // INTERNAL_TRANSFER bills: source and destination sites (must differ — enforced in the service).
+  from_location: {
+    type: String,
+    enum: LOCATIONS,
+    required: function () { return this.transaction_category === 'INTERNAL_TRANSFER'; }
+  },
+  to_location: {
+    type: String,
+    enum: LOCATIONS,
+    required: function () { return this.transaction_category === 'INTERNAL_TRANSFER'; }
   },
   bill_date: {
     type: Date,
@@ -66,11 +113,14 @@ const billSchema = new mongoose.Schema({
   },
   transaction_type: {
     type: String,
-    enum: ['GIVEN', 'RECEIVED', 'SWAP'],
+    enum: ['GIVEN', 'RECEIVED', 'SWAP', 'TRANSFER'],
     required: true
   },
+  // Challan (delivery-note) number — required on real bills; drafts may not have one yet.
   challan_no: {
     type: String,
+    required: function () { return !this.is_draft; },
+    trim: true,
     default: ''
   },
   total_given_qty: {
@@ -93,7 +143,33 @@ const billSchema = new mongoose.Schema({
     type: [{
       edited_at: { type: Date, default: Date.now },
       edited_by: { type: String, default: '' },
-      changes:   { type: [String], default: [] }
+      changes:   { type: [String], default: [] },
+      // Step-up authorization metadata (Phase 18) — WHO approved this edit and how.
+      // Additive alongside the change log; blank on pre-Phase-18 entries.
+      authorized_by:  { type: String, default: '' },  // Trusted Person's name
+      authorized_via: { type: String, default: '' }   // 'OTP' | 'TOTP'
+    }],
+    default: []
+  },
+  // Every verified step-up action on this bill (Phase 18): edits (incl. same-session
+  // corrections that don't reach edit_history) and over-limit override at creation.
+  authorizations: {
+    type: [{
+      action:      { type: String, default: '' },  // 'EDIT' | 'OVER_LIMIT_OVERRIDE'
+      via:         { type: String, default: '' },  // 'OTP' | 'TOTP'
+      person_id:   { type: mongoose.Schema.Types.ObjectId, ref: 'TrustedPerson', default: null },
+      person_name: { type: String, default: '' },
+      at:          { type: Date, default: Date.now }
+    }],
+    default: []
+  },
+  // Quiet traceability for bill-number renames (Phase 8) — deliberately separate from
+  // edit_history so changing only the bill number never shows the "Updated" indicator.
+  bill_number_history: {
+    type: [{
+      old_value:  { type: String, default: '' },
+      new_value:  { type: String, default: '' },
+      changed_at: { type: Date, default: Date.now }
     }],
     default: []
   }
@@ -113,37 +189,74 @@ billSchema.virtual('bill_id').get(function() {
 billSchema.set('toJSON', { virtuals: true });
 billSchema.set('toObject', { virtuals: true });
 
-// Auto-update cylinder status based on transaction direction.
-// A line item's serial_number is the cylinder's rotational number:
-//   RECEIVED -> cylinder is back at-plant
-//   GIVEN    -> cylinder is now in-rotation (with the customer)
+// Auto-update cylinder location/stock_state based on the bill.
+// A line item's serial_number is the cylinder's rotational number.
+//
+// CUSTOMER bills (at doc.location):
+//   RECEIVED -> stock_state IN_STOCK, location = the bill's site
+//   GIVEN    -> stock_state AT_CUSTOMER, location = the site it was given out from
 // RECEIVED is applied BEFORE GIVEN so that a swap round-trip (same rotational
-// number received then given again in one bill) nets out to in-rotation.
-// Uses the (doc, next) signature so save() BLOCKS until the cylinder-status update completes,
-// keeping status updates ordered when several bills are saved back-to-back.
+// number received then given again in one bill) nets out to AT_CUSTOMER.
+//
+// INTERNAL_TRANSFER bills: every serial moves from_location -> to_location;
+// stock_state is NOT touched.
+//
+// Uses the (doc, next) signature so save() BLOCKS until the cylinder update completes,
+// keeping updates ordered when several bills are saved back-to-back.
 billSchema.post('save', function(doc, next) {
   (async () => {
     const Cylinder = require('./Cylinder');
 
+    // Drafts never touch cylinder state — the hook runs only when the bill is finalized.
+    if (doc.is_draft) return;
+
+    if (doc.transaction_category === 'INTERNAL_TRANSFER') {
+      const serials = doc.line_items.map(item => item.serial_number).filter(Boolean);
+      if (serials.length && doc.to_location) {
+        await Cylinder.updateMany(
+          { user_id: doc.user_id, rotational_number: { $in: serials } },
+          { location: doc.to_location }
+        );
+      }
+      return;
+    }
+
     const receivedSerials = doc.line_items
       .filter(item => item.direction === 'RECEIVED')
       .map(item => item.serial_number);
-    // Exclude GIVEN lines already marked returned — those cylinders are back at the plant,
-    // so re-saving the bill must not flip them to in-rotation again.
+    // Exclude GIVEN lines already marked returned — those cylinders are back in stock,
+    // so re-saving the bill must not flip them to AT_CUSTOMER again.
     const givenSerials = doc.line_items
       .filter(item => item.direction === 'GIVEN' && !item.returned_via)
       .map(item => item.serial_number);
 
+    // A serial on BOTH sides of one bill is a round trip whose final state depends on the
+    // travel direction. Inbound (customer swap: was AT_CUSTOMER → received → re-given) must
+    // end AT_CUSTOMER — the received-then-given update order below handles that. Outbound
+    // (filling vendor, Phase 14: was IN_STOCK → sent for filling → received back filled)
+    // must end IN_STOCK — exclude it from the GIVEN flip. Pre-bill state read BEFORE any update.
+    const receivedSet = new Set(receivedSerials);
+    const dual = givenSerials.filter(s => receivedSet.has(s));
+    const outbound = new Set();
+    if (dual.length) {
+      const pre = await Cylinder.find(
+        { user_id: doc.user_id, rotational_number: { $in: dual } },
+        { rotational_number: 1, stock_state: 1 }
+      );
+      pre.forEach(c => { if (c.stock_state === 'IN_STOCK') outbound.add(c.rotational_number); });
+    }
+    const givenFinal = givenSerials.filter(s => !outbound.has(s));
+
     if (receivedSerials.length) {
       await Cylinder.updateMany(
         { user_id: doc.user_id, rotational_number: { $in: receivedSerials } },
-        { status: 'at-plant' }
+        doc.location ? { stock_state: 'IN_STOCK', location: doc.location } : { stock_state: 'IN_STOCK' }
       );
     }
-    if (givenSerials.length) {
+    if (givenFinal.length) {
       await Cylinder.updateMany(
-        { user_id: doc.user_id, rotational_number: { $in: givenSerials } },
-        { status: 'in-rotation' }
+        { user_id: doc.user_id, rotational_number: { $in: givenFinal } },
+        doc.location ? { stock_state: 'AT_CUSTOMER', location: doc.location } : { stock_state: 'AT_CUSTOMER' }
       );
     }
   })()
